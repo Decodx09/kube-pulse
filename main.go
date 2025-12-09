@@ -64,6 +64,7 @@ type PodInfo struct {
 	NodeName  string
 	PodIP     string
 	IsReady   bool
+	Message   string // The "NOTES" column data
 }
 
 type ClusterStats struct {
@@ -83,7 +84,7 @@ const (
 type model struct {
 	client        *kubernetes.Clientset
 	metricsClient *metricsv.Clientset
-	kubeconfig    string // Need this for exec!
+	kubeconfig    string
 
 	pods          []PodInfo
 	filteredPods  []PodInfo
@@ -131,7 +132,6 @@ func main() {
 		panic(err)
 	}
 
-	// Pass configPath to model so we can run kubectl
 	p := tea.NewProgram(initialModel(clientset, metricsClient, configPath), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error: %v", err)
@@ -210,12 +210,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.podToDelete = &selected
 					m.state = viewDeleteConfirm
 				}
-
-			// --- THE MAGIC: SHELL ACCESS ---
 			case "s":
 				if len(m.filteredPods) > 0 {
 					selected := m.filteredPods[m.cursor]
-					// We return a special command that pauses Bubble Tea and runs kubectl exec
 					return m, openShell(selected.Namespace, selected.Name, m.kubeconfig)
 				}
 			}
@@ -223,7 +220,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case viewDeleteConfirm:
 			switch msg.String() {
 			case "y", "Y":
-				m.msg = fmt.Sprintf("🗑️ Deleting %s...", m.podToDelete.Name)
+				m.msg = fmt.Sprintf("Deleting %s...", m.podToDelete.Name)
 				cmd = deletePod(m.client, *m.podToDelete)
 				m.podToDelete = nil
 				m.state = viewList
@@ -308,7 +305,7 @@ func (m model) View() string {
 		return m.diagnosisView()
 	}
 
-	title := headerStyle.Render(" KUBE-PULSE ")
+	title := headerStyle.Render(" KUBE-PULSE PRO ")
 	cpuPerc := 0
 	memPerc := 0
 	if m.clusterStats.TotalCpuCap > 0 {
@@ -317,26 +314,36 @@ func (m model) View() string {
 	if m.clusterStats.TotalMemCap > 0 {
 		memPerc = int((float64(m.clusterStats.TotalMemUsage) / float64(m.clusterStats.TotalMemCap)) * 100)
 	}
-	stats := statsStyle.Render(fmt.Sprintf("  Nodes: %d  │  CPU: %d%%  │  MEM: %d%%", m.clusterStats.NodeCount, cpuPerc, memPerc))
+	stats := statsStyle.Render(fmt.Sprintf("  Nodes: %d  |  CPU: %d%%  |  MEM: %d%%", m.clusterStats.NodeCount, cpuPerc, memPerc))
 	topBar := fmt.Sprintf("%s%s", title, stats)
 
 	var contextInfo string
 	currentNs := m.namespaces[m.currentNsIdx]
 	if len(m.filteredPods) > 0 && m.cursor < len(m.filteredPods) {
 		sel := m.filteredPods[m.cursor]
-		contextInfo = contextStyle.Render(fmt.Sprintf("  NS: %s  •  NODE: %s  •  IP: %s", currentNs, sel.NodeName, sel.PodIP))
+		contextInfo = contextStyle.Render(fmt.Sprintf("  NS: %s  |  NODE: %s  |  IP: %s", currentNs, sel.NodeName, sel.PodIP))
 	} else {
-		contextInfo = lipgloss.NewStyle().Foreground(cDim).Render(fmt.Sprintf("  NS: %s  •  No pods found.", currentNs))
+		contextInfo = lipgloss.NewStyle().Foreground(cDim).Render(fmt.Sprintf("  NS: %s  |  No pods found.", currentNs))
 	}
 
 	var b bytes.Buffer
 	w := tabwriter.NewWriter(&b, 0, 0, 3, ' ', 0)
-	fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%s\t%s\t%s\t\n", "NAMESPACE", "NAME", "RDY", "STATUS", "RST", "CPU", "MEM")
+	// NOTES column added
+	fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t\n", "NAMESPACE", "NAME", "RDY", "STATUS", "RST", "CPU", "MEM", "NOTES")
 
 	start, end := m.calculatePagination()
 	for i := start; i < end; i++ {
 		p := m.filteredPods[i]
-		fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%d\t%s\t%s\t\n", truncate(p.Namespace, 18), truncate(p.Name, 35), p.Ready, p.Status, p.Restarts, p.CpuUsage, p.MemUsage)
+		fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t\n",
+			truncate(p.Namespace, 18),
+			truncate(p.Name, 30),
+			p.Ready,
+			p.Status,
+			p.Restarts,
+			p.CpuUsage,
+			p.MemUsage,
+			truncate(p.Message, 25),
+		)
 	}
 	w.Flush()
 
@@ -363,13 +370,13 @@ func (m model) View() string {
 		if i == m.cursor {
 			rowStyle = selectedRowStyle
 			if len(rawLine) > 2 {
-				rawLine = "▎ " + rawLine[2:]
+				rawLine = "| " + rawLine[2:]
 			}
 		} else {
+			// FIXED SYNTAX ERROR HERE
 			if (p.Status != "Running" && p.Status != "Succeeded") || !p.IsReady {
 				rowStyle = rowStyle.Foreground(cRed)
-			}
-			if p.Restarts > 0 {
+			} else if p.Restarts > 0 {
 				rowStyle = rowStyle.Foreground(cOrange)
 			}
 		}
@@ -384,21 +391,17 @@ func (m model) View() string {
 }
 
 func (m model) deleteConfirmView() string {
-	box := modalStyle.Render(fmt.Sprintf("%s\n\nConfirm deletion of:\n%s\n\n%s / %s", lipgloss.NewStyle().Foreground(cRed).Bold(true).Render("⚠️  DELETE POD"), lipgloss.NewStyle().Foreground(cSecondary).Render(m.podToDelete.Name), lipgloss.NewStyle().Foreground(cGreen).Bold(true).Render("[y] Confirm"), lipgloss.NewStyle().Foreground(cDim).Render("[n] Cancel")))
+	box := modalStyle.Render(fmt.Sprintf("%s\n\nConfirm deletion of:\n%s\n\n%s / %s", lipgloss.NewStyle().Foreground(cRed).Bold(true).Render("[!] DELETE POD"), lipgloss.NewStyle().Foreground(cSecondary).Render(m.podToDelete.Name), lipgloss.NewStyle().Foreground(cGreen).Bold(true).Render("[y] Confirm"), lipgloss.NewStyle().Foreground(cDim).Render("[n] Cancel")))
 	return strings.Repeat("\n", m.height/3) + lipgloss.PlaceHorizontal(m.width, lipgloss.Center, box)
 }
 func (m model) logsView() string {
 	return "\n" + headerStyle.Render(" LOGS: "+m.selectedPod.Name) + "\n\n" + m.viewport.View() + "\n\n" + footerStyle.Render("  [Esc] Back")
 }
 func (m model) diagnosisView() string {
-	return "\n" + diagHeaderStyle.Render(" 🚑 DIAGNOSIS: "+m.selectedPod.Name) + "\n\n" + m.viewport.View() + "\n\n" + footerStyle.Render("  [Esc] Back")
+	return "\n" + diagHeaderStyle.Render(" [DIAGNOSIS]: "+m.selectedPod.Name) + "\n\n" + m.viewport.View() + "\n\n" + footerStyle.Render("  [Esc] Back")
 }
-
-// --- SHELL COMMAND ---
 func openShell(namespace, pod, kubeconfig string) tea.Cmd {
-	return tea.ExecProcess(exec.Command("kubectl", "exec", "-it", "-n", namespace, pod, "--", "/bin/sh", "-c", "bash || sh"), func(err error) tea.Msg {
-		return nil // We don't need to do anything when it returns
-	})
+	return tea.ExecProcess(exec.Command("kubectl", "exec", "-it", "-n", namespace, pod, "--", "/bin/sh", "-c", "bash || sh"), func(err error) tea.Msg { return nil })
 }
 
 // --- HELPERS & ASYNC ---
@@ -473,12 +476,30 @@ func fetchPods(c *kubernetes.Clientset, m *metricsv.Clientset) tea.Cmd {
 			r := int32(0)
 			ready := 0
 			total := len(p.Status.ContainerStatuses)
+			msg := "[OK]"
+
 			for _, c := range p.Status.ContainerStatuses {
 				r += c.RestartCount
 				if c.Ready {
 					ready++
 				}
+				if c.State.Waiting != nil && c.State.Waiting.Reason != "" {
+					msg = c.State.Waiting.Reason
+				} else if c.State.Terminated != nil && c.State.Terminated.Reason != "" {
+					msg = c.State.Terminated.Reason
+					if c.State.Terminated.ExitCode != 0 {
+						msg = fmt.Sprintf("%s (%d)", msg, c.State.Terminated.ExitCode)
+					}
+				}
 			}
+
+			if p.Status.Phase == "Running" && ready == total {
+				msg = "[OK]"
+			}
+			if p.Status.Phase == "Succeeded" {
+				msg = "Completed"
+			}
+
 			cStr, mStr := "-", "-"
 			if u, ok := uMap[p.Namespace+"/"+p.Name]; ok {
 				cStr = fmt.Sprintf("%dm", u.Cpu().MilliValue())
@@ -486,7 +507,12 @@ func fetchPods(c *kubernetes.Clientset, m *metricsv.Clientset) tea.Cmd {
 			}
 			isReady := (ready == total && total > 0) || (p.Status.Phase == "Succeeded")
 			readyStr := fmt.Sprintf("%d/%d", ready, total)
-			list = append(list, PodInfo{Namespace: p.Namespace, Name: p.Name, Ready: readyStr, Status: string(p.Status.Phase), Restarts: r, CpuUsage: cStr, MemUsage: mStr, NodeName: p.Spec.NodeName, PodIP: p.Status.PodIP, IsReady: isReady})
+
+			list = append(list, PodInfo{
+				Namespace: p.Namespace, Name: p.Name, Ready: readyStr, Status: string(p.Status.Phase),
+				Restarts: r, CpuUsage: cStr, MemUsage: mStr, NodeName: p.Spec.NodeName, PodIP: p.Status.PodIP,
+				IsReady: isReady, Message: msg,
+			})
 		}
 		sort.Slice(list, func(i, j int) bool {
 			if list[i].Status != "Running" && list[j].Status == "Running" {
@@ -547,27 +573,27 @@ func diagnosePod(client *kubernetes.Clientset, pod PodInfo) tea.Cmd {
 	return func() tea.Msg {
 		events, err := client.CoreV1().Events(pod.Namespace).List(context.TODO(), metav1.ListOptions{FieldSelector: fmt.Sprintf("involvedObject.name=%s,involvedObject.kind=Pod", pod.Name)})
 		var report strings.Builder
-		report.WriteString(diagTitleStyle.Render("🔎 EVENTS") + "\n")
+		report.WriteString(diagTitleStyle.Render("[EVENTS]") + "\n")
 		if err == nil && len(events.Items) > 0 {
 			for _, e := range events.Items {
 				if e.Type == "Warning" {
-					report.WriteString(fmt.Sprintf("• %s: %s\n", lipgloss.NewStyle().Foreground(cRed).Render(e.Reason), e.Message))
+					report.WriteString(fmt.Sprintf("* %s: %s\n", lipgloss.NewStyle().Foreground(cRed).Render(e.Reason), e.Message))
 				}
 			}
 		} else {
 			report.WriteString("No critical events.\n")
 		}
-		report.WriteString("\n" + diagTitleStyle.Render("🧠 ANALYSIS") + "\n")
+		report.WriteString("\n" + diagTitleStyle.Render("[ANALYSIS]") + "\n")
 		if pod.Restarts > 5 {
-			report.WriteString("🔥 High Restarts: App likely crashing on init.\n")
+			report.WriteString("[!] High Restarts: App likely crashing on init.\n")
 		}
 		if pod.Status == "Pending" {
-			report.WriteString("⏳ Pending: Check Node Capacity / PVC.\n")
+			report.WriteString("[!] Pending: Check Node Capacity / PVC.\n")
 		}
 		if !pod.IsReady && pod.Status == "Running" {
-			report.WriteString("⚠️  Running but Not Ready: Readiness probe failed or app starting.\n")
+			report.WriteString("[!] Running but Not Ready: Readiness probe failed or app starting.\n")
 		}
-		report.WriteString("\n" + diagTitleStyle.Render("📜 LOGS") + "\n")
+		report.WriteString("\n" + diagTitleStyle.Render("[LOGS]") + "\n")
 		req := client.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{TailLines: func(i int64) *int64 { return &i }(15)})
 		stream, _ := req.Stream(context.TODO())
 		if stream != nil {
